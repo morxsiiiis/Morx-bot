@@ -5,6 +5,71 @@ const {
   ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, AuditLogEvent
 } = require("discord.js");
 const config = require("./config");
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, NoSubscriberBehavior, StreamType } = require("@discordjs/voice");
+const play = require("play-dl");
+
+// Estado de radio por servidor: una radio activa por guild.
+const radioSessions = new Map();
+async function createRadioResource(url) {
+  // play-dl permite URLs compatibles (por ejemplo, streams de audio y enlaces admitidos).
+  const stream = await play.stream(url, { quality: 2 });
+  return createAudioResource(stream.stream, { inputType: stream.type, inlineVolume: true });
+}
+async function startRadio(guild, voiceChannel, url, textChannel) {
+  let session = radioSessions.get(guild.id);
+  if (session) {
+    session.url = url;
+    session.voiceChannel = voiceChannel;
+    session.textChannel = textChannel;
+  } else {
+    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
+    const connection = joinVoiceChannel({
+      channelId: voiceChannel.id,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: false
+    });
+    session = { player, connection, url, voiceChannel, textChannel, restarting: false };
+    radioSessions.set(guild.id, session);
+    connection.subscribe(player);
+    connection.on(VoiceConnectionStatus.Disconnected, async () => {
+      try {
+        await Promise.race([
+          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
+          entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
+        ]);
+      } catch {
+        try { connection.destroy(); } catch {}
+        if (radioSessions.get(guild.id) === session) radioSessions.delete(guild.id);
+      }
+    });
+    player.on("error", err => {
+      console.error(`[RADIO] Error en ${guild.name}:`, err.message);
+      restartRadio(guild.id).catch(e => console.error("[RADIO] No se pudo reiniciar:", e.message));
+    });
+    player.on(AudioPlayerStatus.Idle, () => {
+      restartRadio(guild.id).catch(e => console.error("[RADIO] No se pudo reiniciar:", e.message));
+    });
+  }
+  const resource = await createRadioResource(url);
+  session.player.play(resource);
+  return session;
+}
+async function restartRadio(guildId) {
+  const session = radioSessions.get(guildId);
+  if (!session || session.restarting) return;
+  session.restarting = true;
+  try {
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    if (radioSessions.get(guildId) !== session) return;
+    const resource = await createRadioResource(session.url);
+    session.player.play(resource);
+  } catch (e) {
+    console.error("[RADIO] Error al reconectar el stream:", e.message);
+  } finally {
+    session.restarting = false;
+  }
+}
 
 if (!config.token) {
   console.error("Falta DISCORD_TOKEN. Copia .env.example a .env y pega el token.");
@@ -266,6 +331,44 @@ client.on(Events.GuildMemberAdd, async member => {
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const { commandName } = interaction;
+  if (["radio", "radio-stop", "radio-status"].includes(commandName)) {
+    if (!interaction.guild) return interaction.reply({ content: "Este comando solo funciona dentro de un servidor.", ephemeral: true });
+    if (commandName === "radio-status") {
+      const session = radioSessions.get(interaction.guild.id);
+      return interaction.reply({ content: session ? `📻 Morx está reproduciendo radio en **${session.voiceChannel.name}**.` : "📻 No hay ninguna radio activa en este servidor.", ephemeral: true });
+    }
+    if (commandName === "radio-stop") {
+      const session = radioSessions.get(interaction.guild.id);
+      if (!session) return interaction.reply({ content: "No hay ninguna radio activa.", ephemeral: true });
+      radioSessions.delete(interaction.guild.id);
+      try { session.player.stop(true); } catch {}
+      try { session.connection.destroy(); } catch {}
+      return interaction.reply({ content: "⏹️ Radio detenida; Morx salió del canal de voz.", ephemeral: true });
+    }
+    const voiceChannel = interaction.member?.voice?.channel;
+    if (!voiceChannel) return interaction.reply({ content: "Entra primero al canal de voz donde quieres que Morx se conecte.", ephemeral: true });
+    const me = interaction.guild.members.me;
+    const perms = voiceChannel.permissionsFor(me);
+    if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) {
+      return interaction.reply({ content: "Necesito los permisos **Conectar** y **Hablar** en ese canal de voz.", ephemeral: true });
+    }
+    const url = interaction.options.getString("url", true).trim();
+    if (!/^https?:\/\//i.test(url)) return interaction.reply({ content: "Pega una URL completa que empiece por https:// o http://.", ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    try {
+      const session = await startRadio(interaction.guild, voiceChannel, url, interaction.channel);
+      return interaction.editReply(`📻 Morx se conectó a **${session.voiceChannel.name}** y comenzó la radio. Usa **/radio-stop** para detenerla.
+
+La reproducción depende de que la URL sea un stream compatible y de que el bot permanezca en línea.`);
+    } catch (err) {
+      console.error("[RADIO] No se pudo iniciar:", err);
+      const session = radioSessions.get(interaction.guild.id);
+      if (session && session.voiceChannel?.id === voiceChannel.id && session.player.state.status === AudioPlayerStatus.Idle) {
+        // Keep session for diagnosis; no credentials or URL details are posted publicly.
+      }
+      return interaction.editReply("No pude reproducir esa URL. Prueba con el enlace directo de una radio/stream de audio compatible y verifica que el hosting permita conexiones salientes.");
+    }
+  }
   if (commandName === "socialpanel") {
     if (!isModerator(interaction.member)) return interaction.reply({ content: "No tienes permiso para usar este comando.", ephemeral: true });
     const socialLinks = {
