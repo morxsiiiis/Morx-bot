@@ -2,74 +2,16 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {
   Client, GatewayIntentBits, Partials, Events, EmbedBuilder,
-  ActionRowBuilder, ButtonBuilder, ButtonStyle, PermissionsBitField, AuditLogEvent
+  PermissionsBitField, AuditLogEvent,
+  // Music playback dependencies are installed through package.json.
 } = require("discord.js");
-const config = require("./config");
-const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus, VoiceConnectionStatus, entersState, NoSubscriberBehavior, StreamType } = require("@discordjs/voice");
 const play = require("play-dl");
-
-// Estado de radio por servidor: una radio activa por guild.
-const radioSessions = new Map();
-async function createRadioResource(url) {
-  // play-dl permite URLs compatibles (por ejemplo, streams de audio y enlaces admitidos).
-  const stream = await play.stream(url, { quality: 2 });
-  return createAudioResource(stream.stream, { inputType: stream.type, inlineVolume: true });
-}
-async function startRadio(guild, voiceChannel, url, textChannel) {
-  let session = radioSessions.get(guild.id);
-  if (session) {
-    session.url = url;
-    session.voiceChannel = voiceChannel;
-    session.textChannel = textChannel;
-  } else {
-    const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Play } });
-    const connection = joinVoiceChannel({
-      channelId: voiceChannel.id,
-      guildId: guild.id,
-      adapterCreator: guild.voiceAdapterCreator,
-      selfDeaf: false
-    });
-    session = { player, connection, url, voiceChannel, textChannel, restarting: false };
-    radioSessions.set(guild.id, session);
-    connection.subscribe(player);
-    connection.on(VoiceConnectionStatus.Disconnected, async () => {
-      try {
-        await Promise.race([
-          entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
-          entersState(connection, VoiceConnectionStatus.Connecting, 5_000)
-        ]);
-      } catch {
-        try { connection.destroy(); } catch {}
-        if (radioSessions.get(guild.id) === session) radioSessions.delete(guild.id);
-      }
-    });
-    player.on("error", err => {
-      console.error(`[RADIO] Error en ${guild.name}:`, err.message);
-      restartRadio(guild.id).catch(e => console.error("[RADIO] No se pudo reiniciar:", e.message));
-    });
-    player.on(AudioPlayerStatus.Idle, () => {
-      restartRadio(guild.id).catch(e => console.error("[RADIO] No se pudo reiniciar:", e.message));
-    });
-  }
-  const resource = await createRadioResource(url);
-  session.player.play(resource);
-  return session;
-}
-async function restartRadio(guildId) {
-  const session = radioSessions.get(guildId);
-  if (!session || session.restarting) return;
-  session.restarting = true;
-  try {
-    await new Promise(resolve => setTimeout(resolve, 1500));
-    if (radioSessions.get(guildId) !== session) return;
-    const resource = await createRadioResource(session.url);
-    session.player.play(resource);
-  } catch (e) {
-    console.error("[RADIO] Error al reconectar el stream:", e.message);
-  } finally {
-    session.restarting = false;
-  }
-}
+const {
+  joinVoiceChannel, createAudioPlayer, createAudioResource,
+  AudioPlayerStatus, VoiceConnectionStatus, entersState,
+  NoSubscriberBehavior, StreamType
+} = require("@discordjs/voice");
+const config = require("./config");
 
 if (!config.token) {
   console.error("Falta DISCORD_TOKEN. Copia .env.example a .env y pega el token.");
@@ -93,7 +35,8 @@ const client = new Client({
 const dataDir = path.join(__dirname, "data");
 const statePath = path.join(dataDir, "state.json");
 fs.mkdirSync(dataDir, { recursive: true });
-let state = { lastCounter: config.counter.startingNumber, savedRoles: {}, invites: {} };
+let state = { invites: {} };
+const musicQueues = new Map();
 try {
   if (fs.existsSync(statePath)) state = { ...state, ...JSON.parse(fs.readFileSync(statePath, "utf8")) };
 } catch (e) { console.error("No se pudo leer data/state.json:", e); }
@@ -119,10 +62,7 @@ async function sendLog(type, title, description, fields = []) {
 function safeText(value, max = 900) { return String(value ?? "").slice(0, max) || "No especificado"; }
 function isModerator(member) {
   if (!member) return false;
-  // Permite usar el bot a administradores, miembros con Manage Roles,
-  // o miembros que tengan el rol moderador configurado.
-  if (member.permissions.has(PermissionsBitField.Flags.Administrator) ||
-      member.permissions.has(PermissionsBitField.Flags.ManageRoles)) return true;
+  if (member.permissions.has(PermissionsBitField.Flags.Administrator)) return true;
   return !config.moderation.requireModeratorRole || member.roles.cache.has(config.roles.moderator);
 }
 function canManageTarget(actor, target, botMember) {
@@ -179,55 +119,10 @@ client.on(Events.MessageCreate, async message => {
     }
   }
 
-  if (ch === config.channels.counter) {
-    const raw = message.content.trim();
-    if (!/^\d+$/.test(raw)) {
-      await message.delete().catch(() => {});
-      return;
-    }
-    const expected = Number(state.lastCounter) + 1;
-    const actual = Number(raw);
-    if (actual !== expected) {
-      // Número incorrecto: reinicia el juego automáticamente, sin comando ni sanciones.
-      state.lastCounter = 0;
-      saveState();
-      await message.delete().catch(() => {});
-      const notice = await message.channel.send(`${message.author}, número incorrecto. 🔄 ¡El contador vuelve a **1**!`).catch(() => null);
-      if (notice) setTimeout(() => notice.delete().catch(() => {}), 8000);
-      return;
-    }
-    state.lastCounter = actual;
-    saveState();
-    // Marca los números correctos con una flecha.
-    await message.react("➡️").catch(() => {});
-  }
+
 
   await sendLog("messages", "💬 Mensaje enviado", `Autor: ${message.author.tag} (${message.author.id})\nCanal: <#${message.channelId}>\nContenido: ${safeText(message.content, 700)}\nAdjuntos: ${message.attachments.size}`);
 });
-
-async function restoreRoles(guild, userId) {
-  const saved = state.savedRoles[userId];
-  if (!saved || saved.guildId !== guild.id) return;
-  const member = await guild.members.fetch(userId).catch(() => null);
-  if (!member) { delete state.savedRoles[userId]; saveState(); return; }
-  const botMember = guild.members.me;
-  const validRoles = saved.roleIds.filter(id => {
-    const role = guild.roles.cache.get(id);
-    return role && !role.managed && role.position < botMember.roles.highest.position;
-  });
-  if (validRoles.length) await member.roles.add(validRoles, "Restauración de roles tras el timeout del contador").catch(err => console.error("Error restaurando roles:", err.message));
-  delete state.savedRoles[userId];
-  saveState();
-  await sendLog("roles", "💗 Roles restaurados", `Se restauraron los roles guardados de ${member.user.tag}.`);
-}
-setInterval(async () => {
-  for (const [userId, saved] of Object.entries(state.savedRoles)) {
-    if (saved.restoreAt <= Date.now()) {
-      const guild = client.guilds.cache.get(saved.guildId);
-      if (guild) await restoreRoles(guild, userId);
-    }
-  }
-}, 5000).unref();
 
 client.on(Events.GuildMemberAdd, async member => {
   const ch = await client.channels.fetch(config.channels.welcome).catch(() => null);
@@ -235,14 +130,8 @@ client.on(Events.GuildMemberAdd, async member => {
     const embed = new EmbedBuilder().setColor(config.colors.primary)
       .setDescription(format(config.welcome.message, member, member.guild))
       .setThumbnail(member.user.displayAvatarURL({ size: 256 }));
-    const welcomeImagePath = path.isAbsolute(config.welcome.imageUrl)
-      ? config.welcome.imageUrl : path.join(__dirname, config.welcome.imageUrl);
-    if (config.welcome.imageUrl && fs.existsSync(welcomeImagePath)) embed.setImage("attachment://bienvenidos.png");
-    await ch.send({
-      embeds: [embed],
-      files: config.welcome.imageUrl && fs.existsSync(welcomeImagePath)
-        ? [{ attachment: welcomeImagePath, name: "bienvenidos.png" }] : []
-    }).catch(err => console.error("No se pudo enviar la bienvenida:", err.message));
+    if (config.welcome.imageUrl) embed.setImage(config.welcome.imageUrl);
+    await ch.send({ embeds: [embed] }).catch(() => {});
   }
   await sendLog("joins", "📥 Miembro nuevo", `${member.user.tag} (${member.id}) se unió al servidor.`);
 });
@@ -252,14 +141,8 @@ client.on(Events.GuildMemberRemove, async member => {
     const embed = new EmbedBuilder().setColor(config.colors.primary)
       .setDescription(format(config.goodbye.message, member, member.guild))
       .setThumbnail(member.user.displayAvatarURL({ size: 256 }));
-    const goodbyeImagePath = path.isAbsolute(config.goodbye.imageUrl)
-      ? config.goodbye.imageUrl : path.join(__dirname, config.goodbye.imageUrl);
-    if (config.goodbye.imageUrl && fs.existsSync(goodbyeImagePath)) embed.setImage("attachment://adios.png");
-    await ch.send({
-      embeds: [embed],
-      files: config.goodbye.imageUrl && fs.existsSync(goodbyeImagePath)
-        ? [{ attachment: goodbyeImagePath, name: "adios.png" }] : []
-    }).catch(err => console.error("No se pudo enviar la despedida:", err.message));
+    if (config.goodbye.imageUrl) embed.setImage(config.goodbye.imageUrl);
+    await ch.send({ embeds: [embed] }).catch(() => {});
   }
   await sendLog("leaves", "📤 Miembro salió", `${member.user.tag} (${member.id}) salió o fue expulsado. Mira los audit logs para distinguirlo.`);
 });
@@ -328,77 +211,106 @@ client.on(Events.GuildMemberAdd, async member => {
   }
 });
 
+async function resolveTracks(input) {
+  const isSpotify = /open\.spotify\.com\/(track|album|playlist|episode)/i.test(input);
+  if (isSpotify) {
+    const sp = await play.spotify(input);
+    let items = [];
+    if (sp.type === "track") items = [sp];
+    else if (typeof sp.all_tracks === "function") items = await sp.all_tracks();
+    else if (Array.isArray(sp.tracks)) items = sp.tracks;
+    const result = [];
+    for (const item of items.slice(0, 50)) {
+      const title = item.name || item.title;
+      const artists = (item.artists || []).map(a => a.name || a).join(" ");
+      if (!title) continue;
+      const found = await play.search(`${title} ${artists}`, { limit: 1, source: { youtube: "video" } });
+      if (found?.[0]) result.push({ title: found[0].title || `${title} ${artists}`, url: found[0].url });
+    }
+    return result;
+  }
+  if (/youtu\.be\/|youtube\.com\//i.test(input)) {
+    const info = await play.video_info(input);
+    return [{ title: info.video_details.title, url: input }];
+  }
+  const found = await play.search(input, { limit: 1, source: { youtube: "video" } });
+  return found?.[0] ? [{ title: found[0].title, url: found[0].url }] : [];
+}
+async function playNext(guildId) {
+  const music = musicQueues.get(guildId);
+  if (!music || music.player.state.status === AudioPlayerStatus.Playing || music.player.state.status === AudioPlayerStatus.Buffering) return;
+  const next = music.tracks.shift();
+  if (!next) { music.current = null; return; }
+  music.current = next;
+  try {
+    const stream = await play.stream(next.url, { quality: 2 });
+    const resource = createAudioResource(stream.stream, { inputType: stream.type });
+    music.player.play(resource);
+  } catch (err) {
+    console.error(`No se pudo reproducir ${next.url}:`, err.message);
+    music.current = null;
+    setImmediate(() => playNext(guildId));
+  }
+}
+
 client.on(Events.InteractionCreate, async interaction => {
   if (!interaction.isChatInputCommand()) return;
   const { commandName } = interaction;
-  if (["radio", "radio-stop", "radio-status"].includes(commandName)) {
-    if (!interaction.guild) return interaction.reply({ content: "Este comando solo funciona dentro de un servidor.", ephemeral: true });
-    if (commandName === "radio-status") {
-      const session = radioSessions.get(interaction.guild.id);
-      return interaction.reply({ content: session ? `📻 Morx está reproduciendo radio en **${session.voiceChannel.name}**.` : "📻 No hay ninguna radio activa en este servidor.", ephemeral: true });
-    }
-    if (commandName === "radio-stop") {
-      const session = radioSessions.get(interaction.guild.id);
-      if (!session) return interaction.reply({ content: "No hay ninguna radio activa.", ephemeral: true });
-      radioSessions.delete(interaction.guild.id);
-      try { session.player.stop(true); } catch {}
-      try { session.connection.destroy(); } catch {}
-      return interaction.reply({ content: "⏹️ Radio detenida; Morx salió del canal de voz.", ephemeral: true });
-    }
-    const voiceChannel = interaction.member?.voice?.channel;
-    if (!voiceChannel) return interaction.reply({ content: "Entra primero al canal de voz donde quieres que Morx se conecte.", ephemeral: true });
-    const me = interaction.guild.members.me;
-    const perms = voiceChannel.permissionsFor(me);
-    if (!perms?.has(PermissionsBitField.Flags.Connect) || !perms?.has(PermissionsBitField.Flags.Speak)) {
-      return interaction.reply({ content: "Necesito los permisos **Conectar** y **Hablar** en ese canal de voz.", ephemeral: true });
-    }
-    const url = interaction.options.getString("url", true).trim();
-    if (!/^https?:\/\//i.test(url)) return interaction.reply({ content: "Pega una URL completa que empiece por https:// o http://.", ephemeral: true });
-    await interaction.deferReply({ ephemeral: true });
-    try {
-      const session = await startRadio(interaction.guild, voiceChannel, url, interaction.channel);
-      return interaction.editReply(`📻 Morx se conectó a **${session.voiceChannel.name}** y comenzó la radio. Usa **/radio-stop** para detenerla.
-
-La reproducción depende de que la URL sea un stream compatible y de que el bot permanezca en línea.`);
-    } catch (err) {
-      console.error("[RADIO] No se pudo iniciar:", err);
-      const session = radioSessions.get(interaction.guild.id);
-      if (session && session.voiceChannel?.id === voiceChannel.id && session.player.state.status === AudioPlayerStatus.Idle) {
-        // Keep session for diagnosis; no credentials or URL details are posted publicly.
-      }
-      return interaction.editReply("No pude reproducir esa URL. Prueba con el enlace directo de una radio/stream de audio compatible y verifica que el hosting permita conexiones salientes.");
-    }
-  }
   if (commandName === "socialpanel") {
     if (!isModerator(interaction.member)) return interaction.reply({ content: "No tienes permiso para usar este comando.", ephemeral: true });
-    const socialLinks = {
-      instagram: config.social?.links?.instagram || "https://www.instagram.com/morxsiiiis?igsh=MXBneHZ4NGJra2Jwcw==",
-      tiktok: config.social?.links?.tiktok || "https://www.tiktok.com/@morxsiiis",
-      kick: config.social?.links?.kick || "https://kick.com/morxsiiis"
-    };
-    // Generar el texto directamente con las URLs actuales evita que reaparezca "Añade tu enlace".
-    const socialDescription = [
-      "Sígueme en mis redes oficiales:",
-      `📸 **Instagram:** [@morxsiiiis](${socialLinks.instagram})`,
-      `🎵 **TikTok:** [@morxsiiis](${socialLinks.tiktok})`,
-      `🟢 **Kick:** [morxsiiis](${socialLinks.kick})`
-    ].join("\n");
-    const embed = new EmbedBuilder().setColor(config.colors.primary).setTitle(config.social.title).setDescription(socialDescription);
-    const socialImagePath = path.isAbsolute(config.social.bannerUrl)
-      ? config.social.bannerUrl : path.join(__dirname, config.social.bannerUrl);
-    if (config.social.bannerUrl && fs.existsSync(socialImagePath)) embed.setImage("attachment://redes-sociales.png");
-    const socialButtons = new ActionRowBuilder().addComponents(
-      new ButtonBuilder().setLabel("Instagram").setStyle(ButtonStyle.Link).setURL(socialLinks.instagram),
-      new ButtonBuilder().setLabel("TikTok").setStyle(ButtonStyle.Link).setURL(socialLinks.tiktok),
-      new ButtonBuilder().setLabel("Kick").setStyle(ButtonStyle.Link).setURL(socialLinks.kick)
-    );
-    await interaction.channel.send({
-      embeds: [embed],
-      components: [socialButtons],
-      files: config.social.bannerUrl && fs.existsSync(socialImagePath)
-        ? [{ attachment: socialImagePath, name: "redes-sociales.png" }] : []
-    });
+    const embed = new EmbedBuilder().setColor(config.colors.primary).setTitle(config.social.title).setDescription(config.social.description);
+    if (config.social.bannerUrl) embed.setImage(config.social.bannerUrl);
+    await interaction.channel.send({ embeds: [embed] });
     return interaction.reply({ content: "Panel de redes sociales publicado. 💗", ephemeral: true });
+  }
+  // Music commands are available to members, not only moderators.
+  if (["play", "skip", "stop", "pause", "resume", "queue"].includes(commandName)) {
+    try {
+      const guildId = interaction.guildId;
+      let music = musicQueues.get(guildId);
+      if (commandName === "play") {
+        const voiceChannel = interaction.member?.voice?.channel;
+        if (!voiceChannel) return interaction.reply({ content: "Entra primero a un canal de voz. 💗", ephemeral: true });
+        const input = interaction.options.getString("enlace", true).trim();
+        await interaction.deferReply();
+        if (!music) {
+          const connection = joinVoiceChannel({ channelId: voiceChannel.id, guildId, adapterCreator: interaction.guild.voiceAdapterCreator, selfDeaf: true });
+          await entersState(connection, VoiceConnectionStatus.Ready, 20_000);
+          const player = createAudioPlayer({ behaviors: { noSubscriber: NoSubscriberBehavior.Pause } });
+          connection.subscribe(player);
+          music = { connection, player, tracks: [], current: null, textChannel: interaction.channel };
+          musicQueues.set(guildId, music);
+          connection.on(VoiceConnectionStatus.Disconnected, async () => {
+            try { await Promise.race([entersState(connection, VoiceConnectionStatus.Signalling, 5_000), entersState(connection, VoiceConnectionStatus.Connecting, 5_000)]); }
+            catch { connection.destroy(); musicQueues.delete(guildId); }
+          });
+          player.on(AudioPlayerStatus.Idle, () => playNext(guildId));
+          player.on("error", err => { console.error("Error de audio:", err.message); playNext(guildId); });
+        } else if (music.connection.joinConfig.channelId !== voiceChannel.id) {
+          return interaction.editReply("Ya estoy reproduciendo música en otro canal de voz.");
+        }
+        const tracks = await resolveTracks(input);
+        if (!tracks.length) return interaction.editReply("No pude encontrar canciones con ese enlace. Prueba un enlace público de YouTube o Spotify.");
+        music.tracks.push(...tracks);
+        const msg = `🎶 Añadido a la cola: **${tracks[0].title}**${tracks.length > 1 ? ` y ${tracks.length - 1} canción(es) más` : ""}.`;
+        if (music.player.state.status !== AudioPlayerStatus.Playing && music.player.state.status !== AudioPlayerStatus.Buffering) await playNext(guildId);
+        return interaction.editReply(msg);
+      }
+      if (!music) return interaction.reply({ content: "No hay música reproduciéndose ahora mismo.", ephemeral: true });
+      if (commandName === "skip") { music.player.stop(true); return interaction.reply("⏭️ Canción saltada."); }
+      if (commandName === "stop") { music.tracks = []; music.current = null; music.player.stop(true); music.connection.destroy(); musicQueues.delete(guildId); return interaction.reply("⏹️ Música detenida y cola borrada."); }
+      if (commandName === "pause") { music.player.pause(); return interaction.reply("⏸️ Música pausada."); }
+      if (commandName === "resume") { music.player.unpause(); return interaction.reply("▶️ Música reanudada."); }
+      if (commandName === "queue") {
+        const upcoming = music.tracks.slice(0, 10).map((t, i) => `${i + 1}. ${t.title}`).join("\n") || "No hay canciones pendientes.";
+        return interaction.reply({ content: `🎶 **Ahora:** ${music.current?.title || "Preparando..."}\n\n**Cola:**\n${upcoming}`, ephemeral: true });
+      }
+    } catch (err) {
+      console.error(`Error en /${commandName}:`, err);
+      const msg = `No pude reproducir esa URL. Comprueba que el enlace sea público y que el hosting permita conexiones salientes. (${err.message})`;
+      if (interaction.deferred || interaction.replied) return interaction.followUp({ content: msg, ephemeral: true }).catch(() => {});
+      return interaction.reply({ content: msg, ephemeral: true }).catch(() => {});
+    }
   }
   if (!isModerator(interaction.member)) return interaction.reply({ content: "No tienes permiso para usar comandos de moderación.", ephemeral: true });
 
@@ -444,14 +356,8 @@ La reproducción depende de que la URL sea un stream compatible y de que el bot 
     if (commandName === "role") {
       const role = interaction.options.getRole("rol");
       const action = interaction.options.getString("accion");
-      if (!botMember.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-        return interaction.reply({ content: "Me falta el permiso **Gestionar roles**. Actívalo en mi rol del servidor.", ephemeral: true });
-      }
-      if (role.managed || role.position >= botMember.roles.highest.position) {
-        return interaction.reply({ content: "No puedo gestionar ese rol: mueve el rol de Morx por encima del rol que quieres asignar.", ephemeral: true });
-      }
-      if (role.position >= interaction.member.roles.highest.position && interaction.user.id !== interaction.guild.ownerId) {
-        return interaction.reply({ content: "Tu rol más alto debe estar por encima del rol que quieres administrar.", ephemeral: true });
+      if (role.managed || role.position >= botMember.roles.highest.position || role.position >= interaction.member.roles.highest.position) {
+        return interaction.reply({ content: "No puedo gestionar ese rol por permisos o jerarquía.", ephemeral: true });
       }
       if (role.id === config.roles.community && action === "remove") {
         return interaction.reply({ content: "El rol normal de comunidad está protegido.", ephemeral: true });
